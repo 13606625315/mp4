@@ -1,39 +1,25 @@
 #include "mp4writer.h"
 
-// 包含FFmpeg头文件
-extern "C" {
-#include <libavformat/avformat.h>
-#include <libavcodec/avcodec.h>
-#include <libavutil/opt.h>
-#include <libavutil/timestamp.h>
-}
-
 #include <iostream>
 #include <filesystem>
+#include <cstring>
+#include <vector>
 
 // 构造函数
 MP4Writer::MP4Writer(const std::string& outputDir, const std::string& prefix)
     : m_outputDir(outputDir)
     , m_filePrefix(prefix)
     , m_isRecording(false)
-    , m_formatContext(nullptr)
-    , m_videoStream(nullptr)
-    , m_codecContext(nullptr)
+    , m_mp4File(MP4_INVALID_FILE_HANDLE)
+    , m_videoTrack(MP4_INVALID_TRACK_ID)
+    , m_timeScale(0)
+    , m_frameRate(0)
     , m_nextPts(0)
 {
     // 确保输出目录存在
     std::filesystem::path dirPath(outputDir);
     if (!std::filesystem::exists(dirPath)) {
         std::filesystem::create_directories(dirPath);
-    }
-
-    // 初始化FFmpeg（仅在第一次使用时需要）
-    static bool ffmpegInitialized = false;
-    if (!ffmpegInitialized) {
-#if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(58, 9, 100)
-        av_register_all();
-#endif
-        ffmpegInitialized = true;
     }
 }
 
@@ -57,26 +43,71 @@ bool MP4Writer::start(int width, int height, int frameRate)
     // 记录开始时间
     m_startTime = std::chrono::system_clock::now();
     
-    // 初始化FFmpeg
-    if (!initializeFFmpeg(width, height, frameRate)) {
-        std::cerr << "Failed to initialize FFmpeg" << std::endl;
+    // 初始化MP4
+    if (!initializeMP4(width, height, frameRate)) {
+        std::cerr << "Failed to initialize MP4" << std::endl;
         return false;
     }
 
     // 创建临时文件路径（最终文件名将在stop时确定）
     m_currentFilePath = m_outputDir + "/" + m_filePrefix + "_temp.mp4";
 
-    // 打开输出文件
-    if (avio_open(&m_formatContext->pb, m_currentFilePath.c_str(), AVIO_FLAG_WRITE) < 0) {
-        std::cerr << "Could not open output file: " << m_currentFilePath << std::endl;
-        cleanupFFmpeg();
+    // 创建MP4文件
+    m_mp4File = MP4Create(m_currentFilePath.c_str(), 0);
+    if (m_mp4File == MP4_INVALID_FILE_HANDLE) {
+        std::cerr << "Could not create output file: " << m_currentFilePath << std::endl;
         return false;
     }
 
-    // 写入文件头
-    if (avformat_write_header(m_formatContext, nullptr) < 0) {
-        std::cerr << "Error writing header" << std::endl;
-        cleanupFFmpeg();
+    // 设置MP4文件属性
+    MP4SetTimeScale(m_mp4File, m_timeScale);
+
+    // 添加H264视频轨道
+    m_videoTrack = MP4AddH264VideoTrack(
+        m_mp4File,
+        m_timeScale,
+        m_timeScale / m_frameRate,
+        width,
+        height,
+        0x64, // AVCProfileIndication - Baseline profile
+        0x00, // profile_compat
+        0x1F, // AVCLevelIndication - Level 3.1
+        3     // 4 bytes length before NAL units
+    );
+
+    if (m_videoTrack == MP4_INVALID_TRACK_ID) {
+        std::cerr << "Could not add video track" << std::endl;
+        cleanupMP4();
+        return false;
+    }
+
+    // 设置视频属性
+    MP4SetVideoProfileLevel(m_mp4File, 0x7F); // Simple profile
+
+    // 添加默认的SPS和PPS
+    // 这是一个基本的SPS示例，实际应用中应该从编码器获取
+    uint8_t sps[] = {
+        0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9, 0x40, 0x50,
+        0x05, 0xBB, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00,
+        0x10, 0x00, 0x00, 0x03, 0x03, 0xC0, 0xF1, 0x42,
+        0x99, 0x60
+    };
+    
+    // 这是一个基本的PPS示例
+    uint8_t pps[] = {
+        0x68, 0xEB, 0xE3, 0xCB, 0x22, 0xC0
+    };
+
+    // 添加SPS和PPS到MP4文件
+    if (!MP4AddH264SequenceParameterSet(m_mp4File, m_videoTrack, sps, sizeof(sps))) {
+        std::cerr << "Could not add SPS" << std::endl;
+        cleanupMP4();
+        return false;
+    }
+
+    if (!MP4AddH264PictureParameterSet(m_mp4File, m_videoTrack, pps, sizeof(pps))) {
+        std::cerr << "Could not add PPS" << std::endl;
+        cleanupMP4();
         return false;
     }
 
@@ -88,38 +119,36 @@ bool MP4Writer::start(int width, int height, int frameRate)
 // 写入H264帧
 bool MP4Writer::writeFrame(const uint8_t* data, int size, bool keyFrame, int64_t pts)
 {
-    if (!m_isRecording || !m_formatContext || !m_videoStream) {
+    if (!m_isRecording || m_mp4File == MP4_INVALID_FILE_HANDLE || m_videoTrack == MP4_INVALID_TRACK_ID) {
         return false;
     }
 
-    AVPacket pkt = { 0 };
-    av_init_packet(&pkt);
-
-    pkt.data = const_cast<uint8_t*>(data);
-    pkt.size = size;
+    // 缓冲区用于转换H264数据格式
+    std::vector<uint8_t> buffer(size + 10); // 额外空间用于可能的格式转换
+    
+    // 转换H264数据格式（从NALU开始码到长度前缀）
+    int convertedSize = convertH264Data(data, size, buffer.data());
+    if (convertedSize <= 0) {
+        // 如果是SPS或PPS帧，convertH264Data会返回0，这是正常的，不需要报错
+        return true;
+    }
     
     // 如果提供了pts，使用它，否则使用自增的pts
+    MP4Duration sampleDuration = MP4_INVALID_DURATION;
     if (pts > 0) {
-        // 转换为FFmpeg时间基准
-        pkt.pts = av_rescale_q(pts, AVRational{1, 1000}, m_videoStream->time_base);
-    } else {
-        pkt.pts = m_nextPts++;
+        // 转换为MP4时间基准
+        m_nextPts = pts * m_timeScale / 1000;
     }
     
-    pkt.dts = pkt.pts;
-    pkt.stream_index = m_videoStream->index;
-    
-    if (keyFrame) {
-        pkt.flags |= AV_PKT_FLAG_KEY;
+    // 写入帧
+    if (!MP4WriteSample(m_mp4File, m_videoTrack, buffer.data(), convertedSize, sampleDuration, 0, keyFrame)) {
+        std::cerr << "Error writing frame" << std::endl;
+        return false;
     }
 
-    // 写入帧
-    int ret = av_interleaved_write_frame(m_formatContext, &pkt);
-    if (ret < 0) {
-        char errBuf[AV_ERROR_MAX_STRING_SIZE];
-        av_strerror(ret, errBuf, AV_ERROR_MAX_STRING_SIZE);
-        std::cerr << "Error writing frame: " << errBuf << std::endl;
-        return false;
+    // 如果没有提供pts，则递增
+    if (pts <= 0) {
+        m_nextPts += m_timeScale / m_frameRate;
     }
 
     return true;
@@ -135,16 +164,13 @@ std::string MP4Writer::stop()
     // 记录结束时间
     m_endTime = std::chrono::system_clock::now();
 
-    // 写入文件尾
-    if (m_formatContext) {
-        av_write_trailer(m_formatContext);
-        if (m_formatContext->pb) {
-            avio_close(m_formatContext->pb);
-        }
+    // 关闭MP4文件
+    if (m_mp4File != MP4_INVALID_FILE_HANDLE) {
+        MP4Close(m_mp4File, 0);
     }
 
-    // 清理FFmpeg资源
-    cleanupFFmpeg();
+    // 清理MP4资源
+    cleanupMP4();
 
     // 生成基于时间的最终文件名
     std::string finalFilePath = m_outputDir + "/" + generateFileName(m_startTime, m_endTime);
@@ -196,81 +222,86 @@ std::string MP4Writer::formatTime(const std::chrono::system_clock::time_point& t
     return ss.str();
 }
 
-// 初始化FFmpeg
-bool MP4Writer::initializeFFmpeg(int width, int height, int frameRate)
+// 初始化MP4
+bool MP4Writer::initializeMP4(int width, int height, int frameRate)
 {
-    // 创建输出格式上下文
-    int ret = avformat_alloc_output_context2(&m_formatContext, nullptr, nullptr, m_currentFilePath.c_str());
-    if (ret < 0 || !m_formatContext) {
-        std::cerr << "Could not create output context" << std::endl;
-        return false;
-    }
-
-    // 查找H264编码器
-    const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
-    if (!codec) {
-        std::cerr << "H264 codec not found" << std::endl;
-        cleanupFFmpeg();
-        return false;
-    }
-
-    // 创建视频流
-    m_videoStream = avformat_new_stream(m_formatContext, nullptr);
-    if (!m_videoStream) {
-        std::cerr << "Could not create video stream" << std::endl;
-        cleanupFFmpeg();
-        return false;
-    }
-
-    // 设置视频流参数
-    m_codecContext = avcodec_alloc_context3(codec);
-    if (!m_codecContext) {
-        std::cerr << "Could not allocate codec context" << std::endl;
-        cleanupFFmpeg();
-        return false;
-    }
-
-    m_codecContext->codec_id = AV_CODEC_ID_H264;
-    m_codecContext->codec_type = AVMEDIA_TYPE_VIDEO;
-    m_codecContext->width = width;
-    m_codecContext->height = height;
-    m_codecContext->time_base = AVRational{1, frameRate};
-    m_codecContext->pix_fmt = AV_PIX_FMT_YUV420P;
-
-    // 复制编解码器参数到流
-    ret = avcodec_parameters_from_context(m_videoStream->codecpar, m_codecContext);
-    if (ret < 0) {
-        std::cerr << "Could not copy codec parameters to stream" << std::endl;
-        cleanupFFmpeg();
-        return false;
-    }
-
-    // 设置流时间基准
-    m_videoStream->time_base = m_codecContext->time_base;
-
-    // 如果格式需要全局头信息
-    if (m_formatContext->oformat->flags & AVFMT_GLOBALHEADER) {
-        m_codecContext->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    }
-
+    // 设置时间刻度和帧率
+    m_timeScale = 90000;  // 常用的MP4时间刻度
+    m_frameRate = frameRate;
+    
     return true;
 }
 
-// 清理FFmpeg资源
-void MP4Writer::cleanupFFmpeg()
+// 清理MP4资源
+void MP4Writer::cleanupMP4()
 {
-    if (m_codecContext) {
-        avcodec_free_context(&m_codecContext);
-        m_codecContext = nullptr;
+    if (m_mp4File != MP4_INVALID_FILE_HANDLE) {
+        MP4Close(m_mp4File, 0);
+        m_mp4File = MP4_INVALID_FILE_HANDLE;
     }
+    
+    m_videoTrack = MP4_INVALID_TRACK_ID;
+}
 
-    if (m_formatContext) {
-        if (!(m_formatContext->oformat->flags & AVFMT_NOFILE) && m_formatContext->pb) {
-            avio_close(m_formatContext->pb);
+// 转换H264数据格式
+int MP4Writer::convertH264Data(const uint8_t* data, int size, uint8_t* outData)
+{
+    // 检查数据是否以H.264开始码开头 (0x00 0x00 0x00 0x01 或 0x00 0x00 0x01)
+    if (size < 4) {
+        return 0;
+    }
+    
+    int startCodeSize = 0;
+    if (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1) {
+        startCodeSize = 4;  // 4字节开始码
+    } else if (data[0] == 0 && data[1] == 0 && data[2] == 1) {
+        startCodeSize = 3;  // 3字节开始码
+    }
+    
+    if (startCodeSize > 0) {
+        // 获取NALU类型 (5位，在第一个字节的低5位)
+        uint8_t naluType = data[startCodeSize] & 0x1F;
+        
+        // 检查是否为SPS或PPS，如果是，我们应该跳过它们，因为它们已经在start()中添加
+        // SPS = 7, PPS = 8
+        if (naluType == 7 || naluType == 8) {
+            std::cout << "跳过" << (naluType == 7 ? "SPS" : "PPS") << "NALU" << std::endl;
+            return 0;
         }
-        avformat_free_context(m_formatContext);
-        m_formatContext = nullptr;
+        
+        // 替换开始码为长度前缀
+        uint32_t naluSize = size - startCodeSize;
+        outData[0] = (naluSize >> 24) & 0xFF;
+        outData[1] = (naluSize >> 16) & 0xFF;
+        outData[2] = (naluSize >> 8) & 0xFF;
+        outData[3] = naluSize & 0xFF;
+        
+        // 复制NALU数据
+        memcpy(outData + 4, data + startCodeSize, naluSize);
+        
+        return naluSize + 4;
+    } else {
+        // 检查是否已经是MP4格式（带有长度前缀）
+        uint32_t naluSize = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
+        
+        // 验证长度是否合理
+        if (naluSize + 4 <= size) {
+            // 获取NALU类型
+            uint8_t naluType = data[4] & 0x1F;
+            
+            // 检查是否为SPS或PPS
+            if (naluType == 7 || naluType == 8) {
+                std::cout << "跳过" << (naluType == 7 ? "SPS" : "PPS") << "NALU" << std::endl;
+                return 0;
+            }
+            
+            // 如果数据已经是MP4格式（带有长度前缀），直接复制
+            memcpy(outData, data, size);
+            return size;
+        } else {
+            // 长度不合理，可能不是MP4格式
+            std::cerr << "无效的H264数据格式" << std::endl;
+            return 0;
+        }
     }
-
-    m_videoStream = nullptr; // 流会随着格式上下文一起释放
 }

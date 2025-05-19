@@ -8,11 +8,8 @@
 #include <iomanip>
 #include <sstream>
 
-// 前向声明，避免包含完整的FFmpeg头文件
-struct AVFormatContext;
-struct AVCodecContext;
-struct AVStream;
-struct AVPacket;
+// 包含mp4v2头文件
+#include <mp4v2/mp4v2.h>
 
 /**
  * @brief H264流写入MP4的类
@@ -88,18 +85,27 @@ private:
     std::string formatTime(const std::chrono::system_clock::time_point& timePoint);
 
     /**
-     * @brief 初始化FFmpeg上下文
+     * @brief 初始化MP4文件
      * @param width 视频宽度
      * @param height 视频高度
      * @param frameRate 帧率
      * @return 是否成功初始化
      */
-    bool initializeFFmpeg(int width, int height, int frameRate);
+    bool initializeMP4(int width, int height, int frameRate);
 
     /**
-     * @brief 清理FFmpeg资源
+     * @brief 清理MP4资源
      */
-    void cleanupFFmpeg();
+    void cleanupMP4();
+    
+    /**
+     * @brief 转换H264 NALU数据格式
+     * @param data 原始H264数据
+     * @param size 数据大小
+     * @param outData 输出缓冲区
+     * @return 转换后的数据大小
+     */
+    int convertH264Data(const uint8_t* data, int size, uint8_t* outData);
 
 private:
     std::string m_outputDir;        // 输出目录
@@ -111,10 +117,11 @@ private:
     std::chrono::system_clock::time_point m_startTime;
     std::chrono::system_clock::time_point m_endTime;
 
-    // FFmpeg相关成员
-    AVFormatContext* m_formatContext;
-    AVStream* m_videoStream;
-    AVCodecContext* m_codecContext;
+    // mp4v2相关成员
+    MP4FileHandle m_mp4File;        // MP4文件句柄
+    MP4TrackId m_videoTrack;        // 视频轨道ID
+    uint32_t m_timeScale;           // 时间刻度
+    uint32_t m_frameRate;           // 帧率
     int64_t m_nextPts;              // 下一帧的PTS
 };
 
